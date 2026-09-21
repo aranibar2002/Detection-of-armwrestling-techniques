@@ -1,0 +1,373 @@
+# ======================================================================
+# CELL 1 — ПОЛНАЯ ПОДГОТОВКА СРЕДЫ ДЛЯ DINO + SWIN-L INFERENCE
+#
+# Рекомендуемая среда Colab:
+# Runtime 2025.07
+# Python 3.11
+# GPU: T4
+#
+# В конце kernel будет специально перезапущен.
+# После переподключения сразу запускай CELL 2.
+# ======================================================================
+
+import sys
+import os
+import shutil
+import signal
+import subprocess
+from pathlib import Path
+
+
+# ======================================================================
+# 1. ПРОВЕРКА PYTHON / GPU
+# ======================================================================
+
+print("=" * 75)
+print("CHECK PYTHON / GPU")
+print("=" * 75)
+
+print("Python:", sys.version)
+
+assert sys.version_info[:2] == (3, 11), (
+    "\nНужен Python 3.11.\n"
+    "В Colab выбери Runtime Version 2025.07."
+)
+
+gpu_check = subprocess.run(
+    [
+        "nvidia-smi",
+        "--query-gpu=name,memory.total",
+        "--format=csv,noheader"
+    ],
+    capture_output=True,
+    text=True
+)
+
+if gpu_check.returncode != 0:
+    raise RuntimeError(
+        "GPU не найдена. Включи T4 GPU."
+    )
+
+print("GPU:", gpu_check.stdout.strip())
+
+
+# ======================================================================
+# ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ
+# ======================================================================
+
+PYTHON = sys.executable
+
+
+def run(cmd):
+    print("\n" + "=" * 75)
+    print(">", " ".join(cmd))
+    print("=" * 75)
+
+    subprocess.check_call(cmd)
+
+
+# ======================================================================
+# 2. PIP / SETUPTOOLS
+# ======================================================================
+
+run([
+    PYTHON, "-m", "pip",
+    "install",
+    "--upgrade",
+    "pip",
+    "wheel"
+])
+
+run([
+    PYTHON, "-m", "pip",
+    "install",
+    "--force-reinstall",
+    "setuptools==69.5.1"
+])
+
+
+# ======================================================================
+# 3. УДАЛЯЕМ КОНФЛИКТУЮЩИЕ ВЕРСИИ
+# ======================================================================
+
+run([
+    PYTHON, "-m", "pip",
+    "uninstall", "-y",
+
+    "torch",
+    "torchvision",
+    "torchaudio",
+
+    "mmcv",
+    "mmcv-lite",
+    "mmengine",
+    "mmdet",
+    "openmim",
+
+    "opencv-python",
+    "opencv-python-headless",
+    "opencv-contrib-python"
+])
+
+
+# ======================================================================
+# 4. NUMPY 1.26.4
+# ======================================================================
+
+run([
+    PYTHON, "-m", "pip",
+    "install",
+    "--no-cache-dir",
+    "--force-reinstall",
+    "numpy==1.26.4"
+])
+
+
+# ======================================================================
+# 5. PYTORCH 2.1 + CUDA 12.1
+# ======================================================================
+
+run([
+    PYTHON, "-m", "pip",
+    "install",
+    "--no-cache-dir",
+
+    "torch==2.1.0",
+    "torchvision==0.16.0",
+
+    "--index-url",
+    "https://download.pytorch.org/whl/cu121"
+])
+
+
+# ======================================================================
+# 6. OPENCV БЕЗ ОБНОВЛЕНИЯ NUMPY
+# ======================================================================
+
+run([
+    PYTHON, "-m", "pip",
+    "install",
+    "--no-cache-dir",
+    "--no-deps",
+    "opencv-python-headless==4.8.1.78"
+])
+
+
+# ======================================================================
+# 7. MMENGINE + ЗАВИСИМОСТИ
+# ======================================================================
+
+run([
+    PYTHON, "-m", "pip",
+    "install",
+    "--no-cache-dir",
+
+    "mmengine==0.10.7",
+
+    "addict",
+    "packaging",
+    "Pillow",
+    "PyYAML",
+    "yapf==0.40.1",
+
+    "matplotlib",
+    "pycocotools",
+    "scipy",
+    "shapely",
+    "six",
+    "terminaltables",
+    "tqdm",
+    "rich",
+    "termcolor"
+])
+
+
+# ======================================================================
+# 8. ЕЩЁ РАЗ ЖЁСТКО ФИКСИРУЕМ NUMPY
+# ======================================================================
+
+run([
+    PYTHON, "-m", "pip",
+    "install",
+    "--no-cache-dir",
+    "--force-reinstall",
+    "--no-deps",
+    "numpy==1.26.4"
+])
+
+
+# ======================================================================
+# 9. MMCV 2.1.0
+#
+# Готовый wheel:
+# Python 3.11
+# Torch 2.1
+# CUDA 12.1
+# ======================================================================
+
+MMCV_WHEEL = (
+    "https://download.openmmlab.com/mmcv/dist/"
+    "cu121/torch2.1.0/"
+    "mmcv-2.1.0-cp311-cp311-manylinux1_x86_64.whl"
+)
+
+run([
+    PYTHON, "-m", "pip",
+    "install",
+    "--no-cache-dir",
+    "--no-deps",
+    MMCV_WHEEL
+])
+
+
+# ======================================================================
+# 10. MMDETECTION 3.3.0
+# ======================================================================
+
+run([
+    PYTHON, "-m", "pip",
+    "install",
+    "--no-cache-dir",
+    "--no-deps",
+    "mmdet==3.3.0"
+])
+
+
+# ======================================================================
+# 11. СКАЧИВАЕМ РЕПОЗИТОРИЙ MMDETECTION
+#
+# Нужен для configs и внутренних ресурсов.
+# Сам пакет уже установлен.
+# ======================================================================
+
+MMDET_ROOT = Path(
+    "/content/mmdetection"
+)
+
+if MMDET_ROOT.exists():
+    shutil.rmtree(
+        MMDET_ROOT,
+        ignore_errors=True
+    )
+
+run([
+    "git",
+    "clone",
+    "--depth", "1",
+    "--branch", "v3.3.0",
+
+    "https://github.com/open-mmlab/mmdetection.git",
+
+    str(MMDET_ROOT)
+])
+
+
+# ======================================================================
+# 12. ОЧИЩАЕМ PIP CACHE
+# ======================================================================
+
+subprocess.run(
+    [
+        PYTHON,
+        "-m",
+        "pip",
+        "cache",
+        "purge"
+    ],
+    check=False
+)
+
+
+# ======================================================================
+# 13. ФИНАЛЬНАЯ ПРОВЕРКА В ОТДЕЛЬНОМ PYTHON-ПРОЦЕССЕ
+#
+# Поэтому проверка не зависит от старых импортов текущего kernel.
+# ======================================================================
+
+CHECK = r'''
+import sys
+
+import numpy as np
+import cv2
+import torch
+import torchvision
+
+import mmcv
+import mmengine
+import mmdet
+
+from mmcv.ops import MultiScaleDeformableAttention
+from mmdet.apis import init_detector, inference_detector
+
+
+print("\n" + "=" * 70)
+print("FINAL ENVIRONMENT CHECK")
+print("=" * 70)
+
+print("Python       :", sys.version.split()[0])
+print("NumPy        :", np.__version__)
+print("OpenCV       :", cv2.__version__)
+print("PyTorch      :", torch.__version__)
+print("Torchvision  :", torchvision.__version__)
+print("CUDA         :", torch.version.cuda)
+print("CUDA ready   :", torch.cuda.is_available())
+print("MMCV         :", mmcv.__version__)
+print("MMEngine     :", mmengine.__version__)
+print("MMDetection  :", mmdet.__version__)
+
+if torch.cuda.is_available():
+    print("GPU          :", torch.cuda.get_device_name(0))
+
+assert sys.version_info[:2] == (3, 11)
+assert np.__version__ == "1.26.4"
+assert torch.__version__.startswith("2.1.0")
+assert torchvision.__version__.startswith("0.16.0")
+assert torch.cuda.is_available()
+assert mmcv.__version__ == "2.1.0"
+assert mmengine.__version__ == "0.10.7"
+assert mmdet.__version__ == "3.3.0"
+
+# Реальная CUDA операция
+x = torch.randn(512, 512, device="cuda")
+y = x @ x
+torch.cuda.synchronize()
+del x, y
+
+print("✓ PyTorch CUDA works")
+print("✓ MMCV CUDA ops imported")
+print("✓ MMDetection inference API imported")
+
+print("\n" + "=" * 70)
+print("ENVIRONMENT READY")
+print("=" * 70)
+'''
+
+subprocess.check_call(
+    [
+        PYTHON,
+        "-c",
+        CHECK
+    ]
+)
+
+
+# ======================================================================
+# 14. RESTART KERNEL
+# ======================================================================
+
+print(
+    "\nУстановка завершена успешно.\n"
+    "Kernel сейчас специально перезапустится.\n"
+    "После переподключения запускай CELL 2."
+)
+
+os.kill(
+    os.getpid(),
+    signal.SIGKILL
+)
+
+
+
+
+
+
