@@ -1,0 +1,1512 @@
+# ======================================================================
+# DINO + SWIN-L INFERENCE -> CVAT-COMPATIBLE COCO 1.0 JSON
+#
+# ПАКЕТЫ УЖЕ УСТАНОВЛЕНЫ.
+#
+# 3 ПУТИ:
+#
+# 1. MODEL_DIR
+#    Папка с:
+#       *.pth   - лучшие веса
+#       *.py    - config
+#       *.json  - metrics (может лежать, для inference не нужен)
+#
+# 2. INPUT_IMAGES_DIR
+#    Папка с изображениями
+#
+# 3. OUTPUT_DIR
+#    Папка, куда будет сохранён:
+#       instances_cvat.json
+#
+# Итоговый JSON:
+#   строгий COCO Instances
+#   пригоден для:
+#
+#   CVAT -> Upload annotations -> COCO 1.0
+#
+# ======================================================================
+
+
+from google.colab import drive
+drive.mount("/content/drive")
+
+import gc
+import json
+import shutil
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+
+from tqdm.auto import tqdm
+
+from mmengine.config import Config
+from mmdet.apis import (
+    init_detector,
+    inference_detector
+)
+
+
+# ======================================================================
+# 1. ТРИ ПУТИ — МЕНЯЕШЬ ТОЛЬКО ИХ
+# ======================================================================
+
+# Папка с:
+# best_dino_swin_l_map50_95.pth
+# dino_swin_l_arm_config.py
+# best_metrics.json
+
+MODEL_DIR = Path(
+    "/content/drive/MyDrive/Да_да_да/Detection/Weights"
+)
+
+
+# Папка с изображениями для инференса
+
+INPUT_IMAGES_DIR = Path(
+    "/content/drive/MyDrive/Да_да_да/Detection/Inference/images"
+)
+
+
+# Папка, куда будет сохранён готовый CVAT JSON
+
+OUTPUT_DIR = Path(
+    "/content/drive/MyDrive/Да_да_да/Detection/Inference/Output"
+)
+
+
+# ======================================================================
+# 2. НАСТРОЙКИ INFERENCE
+# ======================================================================
+
+DEVICE = (
+    "cuda:0"
+    if torch.cuda.is_available()
+    else "cpu"
+)
+
+
+# ------------------------------------------------------------
+# CONFIDENCE THRESHOLD
+#
+# Все предсказания ниже этого confidence удаляются.
+#
+# При обучении для дополнительных метрик мы использовали 0.25,
+# поэтому оставляем то же значение.
+# ------------------------------------------------------------
+
+SCORE_THRESHOLD = 0.25
+
+
+# ------------------------------------------------------------
+# ОСТАВЛЯТЬ ТОЛЬКО 2 СПОРТСМЕНОВ?
+#
+# False:
+# сохраняются ВСЕ детекции >= threshold.
+#
+# True:
+# сохраняются только 2 наиболее уверенные детекции.
+#
+# Я рекомендую сначала False, чтобы вручную проверить
+# ложные срабатывания в CVAT.
+# ------------------------------------------------------------
+
+KEEP_ONLY_TOP_2 = False
+
+TOP_K = 2
+
+
+# ======================================================================
+# 3. КЛАССЫ
+#
+# ДОЛЖНЫ БЫТЬ В ТОМ ЖЕ ПОРЯДКЕ, ЧТО И ПРИ ОБУЧЕНИИ
+# ======================================================================
+
+CLASSES = (
+    "Toproll",
+    "Hook",
+    "Press",
+    "Kingsmove",
+)
+
+
+# MMDetection labels:
+#
+# 0 -> Toproll
+# 1 -> Hook
+# 2 -> Press
+# 3 -> Kingsmove
+#
+# COCO category_id:
+#
+# 1 -> Toproll
+# 2 -> Hook
+# 3 -> Press
+# 4 -> Kingsmove
+
+LABEL_TO_CATEGORY_ID = {
+    0: 1,
+    1: 2,
+    2: 3,
+    3: 4,
+}
+
+
+# ======================================================================
+# 4. CVAT FILE NAME MODE
+#
+# Обычно при загрузке обычных изображений в CVAT имя изображения:
+#
+# hook_001.jpg
+#
+# Поэтому True — самый безопасный вариант.
+#
+# Если ты создавал CVAT task из ZIP с сохранением вложенных папок:
+#
+# folder/hook_001.jpg
+#
+# тогда поставь False.
+# ======================================================================
+
+USE_ONLY_FILENAME_FOR_CVAT = True
+
+
+# ======================================================================
+# 5. ПРОВЕРКА ПУТЕЙ
+# ======================================================================
+
+if not MODEL_DIR.is_dir():
+
+    raise FileNotFoundError(
+        f"Не найдена папка модели:\n"
+        f"{MODEL_DIR}"
+    )
+
+
+if not INPUT_IMAGES_DIR.is_dir():
+
+    raise FileNotFoundError(
+        f"Не найдена папка изображений:\n"
+        f"{INPUT_IMAGES_DIR}"
+    )
+
+
+OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+FINAL_JSON = (
+    OUTPUT_DIR
+    /
+    "instances_cvat.json"
+)
+
+
+# ======================================================================
+# 6. ЛОКАЛЬНЫЕ ПАПКИ
+#
+# Копируем всё с Google Drive один раз.
+# Во время inference модель читает изображения из /content.
+# ======================================================================
+
+LOCAL_ROOT = Path(
+    "/content/dino_inference"
+)
+
+LOCAL_MODEL_DIR = (
+    LOCAL_ROOT
+    /
+    "model"
+)
+
+LOCAL_IMAGES_DIR = (
+    LOCAL_ROOT
+    /
+    "images"
+)
+
+
+if LOCAL_ROOT.exists():
+
+    shutil.rmtree(
+        LOCAL_ROOT,
+        ignore_errors=True
+    )
+
+
+LOCAL_ROOT.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+# ======================================================================
+# 7. COPY MODEL -> /content
+# ======================================================================
+
+print("=" * 76)
+
+print(
+    "COPY MODEL TO /content"
+)
+
+print("=" * 76)
+
+
+shutil.copytree(
+    MODEL_DIR,
+    LOCAL_MODEL_DIR
+)
+
+
+print(
+    "✓ Model copied"
+)
+
+
+# ======================================================================
+# 8. COPY IMAGES -> /content
+# ======================================================================
+
+print("\n" + "=" * 76)
+
+print(
+    "COPY IMAGES TO /content"
+)
+
+print("=" * 76)
+
+
+shutil.copytree(
+    INPUT_IMAGES_DIR,
+    LOCAL_IMAGES_DIR
+)
+
+
+print(
+    "✓ Images copied"
+)
+
+
+# ======================================================================
+# 9. НАХОДИМ CONFIG
+# ======================================================================
+
+config_candidates = list(
+    LOCAL_MODEL_DIR.glob(
+        "*.py"
+    )
+)
+
+
+if len(config_candidates) == 0:
+
+    raise FileNotFoundError(
+        "В MODEL_DIR не найден .py config."
+    )
+
+
+preferred_configs = [
+
+    p
+
+    for p in config_candidates
+
+    if (
+        "dino_swin_l_arm_config"
+        in
+        p.name.lower()
+    )
+]
+
+
+if len(preferred_configs) >= 1:
+
+    CONFIG_PATH = (
+        preferred_configs[0]
+    )
+
+
+elif len(config_candidates) == 1:
+
+    CONFIG_PATH = (
+        config_candidates[0]
+    )
+
+
+else:
+
+    print(
+        "\nНайдено несколько .py:"
+    )
+
+    for p in config_candidates:
+        print(" ", p.name)
+
+    raise RuntimeError(
+        "Не удалось автоматически выбрать config."
+    )
+
+
+# ======================================================================
+# 10. НАХОДИМ ВЕСА
+# ======================================================================
+
+weight_candidates = list(
+    LOCAL_MODEL_DIR.glob(
+        "*.pth"
+    )
+)
+
+
+if len(weight_candidates) == 0:
+
+    raise FileNotFoundError(
+        "В MODEL_DIR не найден .pth checkpoint."
+    )
+
+
+# Сначала ищем точное стандартное имя.
+
+preferred_weights = [
+
+    p
+
+    for p in weight_candidates
+
+    if (
+        p.name.lower()
+        ==
+        "best_dino_swin_l_map50_95.pth"
+    )
+]
+
+
+if len(preferred_weights) >= 1:
+
+    CHECKPOINT_PATH = (
+        preferred_weights[0]
+    )
+
+
+else:
+
+    # Если стандартного имени нет —
+    # пробуем найти единственный файл со словом best.
+
+    best_weights = [
+
+        p
+
+        for p in weight_candidates
+
+        if "best" in p.name.lower()
+    ]
+
+
+    if len(best_weights) == 1:
+
+        CHECKPOINT_PATH = (
+            best_weights[0]
+        )
+
+
+    elif len(weight_candidates) == 1:
+
+        CHECKPOINT_PATH = (
+            weight_candidates[0]
+        )
+
+
+    else:
+
+        print(
+            "\nНайдено несколько .pth:"
+        )
+
+        for p in weight_candidates:
+            print(" ", p.name)
+
+        raise RuntimeError(
+            "Не удалось автоматически определить "
+            "лучшие веса."
+        )
+
+
+# ======================================================================
+# 11. ИЩЕМ ВСЕ ИЗОБРАЖЕНИЯ
+# ======================================================================
+
+IMAGE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".bmp",
+    ".webp",
+    ".tif",
+    ".tiff",
+}
+
+
+image_paths = sorted(
+
+    p
+
+    for p in LOCAL_IMAGES_DIR.rglob("*")
+
+    if (
+        p.is_file()
+        and
+        p.suffix.lower()
+        in IMAGE_EXTENSIONS
+    )
+)
+
+
+if len(image_paths) == 0:
+
+    raise FileNotFoundError(
+        "Во входной папке нет изображений."
+    )
+
+
+# ======================================================================
+# 12. ПРОВЕРЯЕМ ИМЕНА
+#
+# Если USE_ONLY_FILENAME_FOR_CVAT=True,
+# одинаковых basename быть не должно.
+# ======================================================================
+
+if USE_ONLY_FILENAME_FOR_CVAT:
+
+    names = [
+        p.name
+        for p in image_paths
+    ]
+
+    if (
+        len(names)
+        !=
+        len(set(names))
+    ):
+
+        raise RuntimeError(
+            "\nОбнаружены одинаковые имена файлов "
+            "в разных подпапках.\n"
+            "Нельзя безопасно использовать "
+            "USE_ONLY_FILENAME_FOR_CVAT=True.\n"
+            "Поставь False."
+        )
+
+
+# ======================================================================
+# 13. INFO
+# ======================================================================
+
+print("\n" + "=" * 76)
+
+print(
+    "INFERENCE SETTINGS"
+)
+
+print("=" * 76)
+
+
+print(
+    "Config:"
+)
+
+print(
+    CONFIG_PATH
+)
+
+
+print(
+    "\nCheckpoint:"
+)
+
+print(
+    CHECKPOINT_PATH
+)
+
+
+print(
+    "\nImages:",
+    len(image_paths)
+)
+
+
+print(
+    "Device:",
+    DEVICE
+)
+
+
+print(
+    "Threshold:",
+    SCORE_THRESHOLD
+)
+
+
+print(
+    "Keep top 2:",
+    KEEP_ONLY_TOP_2
+)
+
+
+print(
+    "CVAT basename mode:",
+    USE_ONLY_FILENAME_FOR_CVAT
+)
+
+
+print(
+    "\nOutput:"
+)
+
+print(
+    FINAL_JSON
+)
+
+print("=" * 76)
+
+
+# ======================================================================
+# 14. LOAD CONFIG
+# ======================================================================
+
+cfg = Config.fromfile(
+    str(
+        CONFIG_PATH
+    )
+)
+
+
+# ======================================================================
+# 15. LOAD MODEL
+# ======================================================================
+
+gc.collect()
+
+
+if torch.cuda.is_available():
+
+    torch.cuda.empty_cache()
+
+
+print(
+    "\nLoading DINO + Swin-L..."
+)
+
+
+model = init_detector(
+
+    cfg,
+
+    str(
+        CHECKPOINT_PATH
+    ),
+
+    device=DEVICE,
+
+    palette="random"
+)
+
+
+# Жёстко задаём именно наши классы.
+
+model.dataset_meta = {
+
+    "classes":
+        CLASSES,
+
+    "palette":
+        "random"
+}
+
+
+model.eval()
+
+
+print(
+    "✓ Model loaded"
+)
+
+
+print(
+    "\nClasses:"
+)
+
+
+for index, name in enumerate(
+    CLASSES
+):
+
+    print(
+        f"  {index} -> {name}"
+    )
+
+
+# ======================================================================
+# 16. СТРОГИЙ COCO INSTANCES ДЛЯ CVAT
+#
+# НИКАКИХ:
+#
+# score
+# confidence
+# inference_summary
+# model_name
+# prediction
+# дополнительных attributes
+#
+# Только стандартные COCO поля.
+# ======================================================================
+
+coco = {
+
+    "images": [],
+
+    "annotations": [],
+
+    "categories": [
+
+        {
+            "id": 1,
+            "name": "Toproll",
+            "supercategory": ""
+        },
+
+        {
+            "id": 2,
+            "name": "Hook",
+            "supercategory": ""
+        },
+
+        {
+            "id": 3,
+            "name": "Press",
+            "supercategory": ""
+        },
+
+        {
+            "id": 4,
+            "name": "Kingsmove",
+            "supercategory": ""
+        },
+    ]
+}
+
+
+# ======================================================================
+# 17. СТАТИСТИКА — ТОЛЬКО ВЫВОДИМ В COLAB
+#
+# В JSON ЭТО НЕ ЗАПИСЫВАЕТСЯ.
+# ======================================================================
+
+annotation_id = 1
+
+total_detections = 0
+
+count_0 = 0
+count_1 = 0
+count_2 = 0
+count_more_2 = 0
+
+
+# ======================================================================
+# 18. INFERENCE
+# ======================================================================
+
+print("\n" + "=" * 76)
+
+print(
+    "START INFERENCE"
+)
+
+print("=" * 76)
+
+
+with torch.inference_mode():
+
+    for image_id, image_path in enumerate(
+
+        tqdm(
+            image_paths,
+            desc="DINO inference"
+        ),
+
+        start=1
+    ):
+
+        # ------------------------------------------------------
+        # READ IMAGE
+        # ------------------------------------------------------
+
+        image = cv2.imread(
+            str(
+                image_path
+            )
+        )
+
+
+        if image is None:
+
+            raise RuntimeError(
+                f"Не удалось прочитать:\n"
+                f"{image_path}"
+            )
+
+
+        height, width = (
+            image.shape[:2]
+        )
+
+
+        # ------------------------------------------------------
+        # FILE NAME FOR CVAT
+        # ------------------------------------------------------
+
+        if USE_ONLY_FILENAME_FOR_CVAT:
+
+            file_name = (
+                image_path.name
+            )
+
+        else:
+
+            file_name = (
+                image_path
+                .relative_to(
+                    LOCAL_IMAGES_DIR
+                )
+                .as_posix()
+            )
+
+
+        # ------------------------------------------------------
+        # COCO IMAGE RECORD
+        # ------------------------------------------------------
+
+        coco[
+            "images"
+        ].append(
+            {
+                "id":
+                    int(
+                        image_id
+                    ),
+
+                "width":
+                    int(
+                        width
+                    ),
+
+                "height":
+                    int(
+                        height
+                    ),
+
+                "file_name":
+                    str(
+                        file_name
+                    )
+            }
+        )
+
+
+        # ------------------------------------------------------
+        # MODEL INFERENCE
+        # ------------------------------------------------------
+
+        result = inference_detector(
+
+            model,
+
+            str(
+                image_path
+            )
+        )
+
+
+        pred = (
+            result
+            .pred_instances
+            .cpu()
+        )
+
+
+        boxes = (
+            pred.bboxes.numpy()
+        )
+
+
+        scores = (
+            pred.scores.numpy()
+        )
+
+
+        labels = (
+            pred.labels.numpy()
+            .astype(
+                np.int64
+            )
+        )
+
+
+        # ------------------------------------------------------
+        # SCORE FILTER
+        # ------------------------------------------------------
+
+        keep = (
+            scores
+            >=
+            SCORE_THRESHOLD
+        )
+
+
+        boxes = (
+            boxes[
+                keep
+            ]
+        )
+
+
+        scores = (
+            scores[
+                keep
+            ]
+        )
+
+
+        labels = (
+            labels[
+                keep
+            ]
+        )
+
+
+        # ------------------------------------------------------
+        # SORT BY CONFIDENCE
+        #
+        # Confidence используется только ВНУТРИ скрипта.
+        # В CVAT JSON он НЕ попадёт.
+        # ------------------------------------------------------
+
+        if len(scores) > 0:
+
+            order = np.argsort(
+                -scores
+            )
+
+            boxes = (
+                boxes[
+                    order
+                ]
+            )
+
+            scores = (
+                scores[
+                    order
+                ]
+            )
+
+            labels = (
+                labels[
+                    order
+                ]
+            )
+
+
+        # ------------------------------------------------------
+        # OPTIONAL TOP-2
+        # ------------------------------------------------------
+
+        if KEEP_ONLY_TOP_2:
+
+            boxes = (
+                boxes[
+                    :TOP_K
+                ]
+            )
+
+            scores = (
+                scores[
+                    :TOP_K
+                ]
+            )
+
+            labels = (
+                labels[
+                    :TOP_K
+                ]
+            )
+
+
+        n_predictions = len(
+            boxes
+        )
+
+
+        if n_predictions == 0:
+
+            count_0 += 1
+
+        elif n_predictions == 1:
+
+            count_1 += 1
+
+        elif n_predictions == 2:
+
+            count_2 += 1
+
+        else:
+
+            count_more_2 += 1
+
+
+        # ------------------------------------------------------
+        # CREATE COCO ANNOTATIONS
+        #
+        # MMDetection:
+        # [x1, y1, x2, y2]
+        #
+        # COCO:
+        # [x, y, width, height]
+        # ------------------------------------------------------
+
+        for box, label in zip(
+
+            boxes,
+
+            labels
+        ):
+
+            label = int(
+                label
+            )
+
+
+            if (
+                label
+                not in
+                LABEL_TO_CATEGORY_ID
+            ):
+
+                raise ValueError(
+                    f"Неизвестный label: {label}"
+                )
+
+
+            x1, y1, x2, y2 = [
+
+                float(x)
+
+                for x in box
+            ]
+
+
+            # --------------------------------------------------
+            # CLIP TO IMAGE
+            # --------------------------------------------------
+
+            x1 = max(
+                0.0,
+                min(
+                    x1,
+                    float(width)
+                )
+            )
+
+
+            y1 = max(
+                0.0,
+                min(
+                    y1,
+                    float(height)
+                )
+            )
+
+
+            x2 = max(
+                0.0,
+                min(
+                    x2,
+                    float(width)
+                )
+            )
+
+
+            y2 = max(
+                0.0,
+                min(
+                    y2,
+                    float(height)
+                )
+            )
+
+
+            bbox_width = (
+                x2 - x1
+            )
+
+
+            bbox_height = (
+                y2 - y1
+            )
+
+
+            if (
+                bbox_width <= 0
+                or
+                bbox_height <= 0
+            ):
+
+                continue
+
+
+            category_id = (
+                LABEL_TO_CATEGORY_ID[
+                    label
+                ]
+            )
+
+
+            # --------------------------------------------------
+            # STRICT COCO ANNOTATION
+            #
+            # ВАЖНО:
+            # score здесь НЕТ.
+            # --------------------------------------------------
+
+            annotation = {
+
+                "id":
+                    int(
+                        annotation_id
+                    ),
+
+                "image_id":
+                    int(
+                        image_id
+                    ),
+
+                "category_id":
+                    int(
+                        category_id
+                    ),
+
+                "bbox": [
+                    round(
+                        float(
+                            x1
+                        ),
+                        4
+                    ),
+
+                    round(
+                        float(
+                            y1
+                        ),
+                        4
+                    ),
+
+                    round(
+                        float(
+                            bbox_width
+                        ),
+                        4
+                    ),
+
+                    round(
+                        float(
+                            bbox_height
+                        ),
+                        4
+                    ),
+                ],
+
+                "area":
+                    round(
+                        float(
+                            bbox_width
+                            *
+                            bbox_height
+                        ),
+                        4
+                    ),
+
+                "segmentation":
+                    [],
+
+                "iscrowd":
+                    0
+            }
+
+
+            coco[
+                "annotations"
+            ].append(
+                annotation
+            )
+
+
+            annotation_id += 1
+
+            total_detections += 1
+
+
+# ======================================================================
+# 19. ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА COCO ПЕРЕД СОХРАНЕНИЕМ
+# ======================================================================
+
+print(
+    "\nChecking generated COCO..."
+)
+
+
+image_ids = {
+
+    int(
+        x["id"]
+    )
+
+    for x in coco[
+        "images"
+    ]
+}
+
+
+category_ids = {
+
+    int(
+        x["id"]
+    )
+
+    for x in coco[
+        "categories"
+    ]
+}
+
+
+annotation_ids = []
+
+
+for ann in coco[
+    "annotations"
+]:
+
+    # Только разрешённые ключи.
+
+    allowed_keys = {
+        "id",
+        "image_id",
+        "category_id",
+        "bbox",
+        "area",
+        "segmentation",
+        "iscrowd",
+    }
+
+
+    unknown_keys = (
+        set(
+            ann.keys()
+        )
+        -
+        allowed_keys
+    )
+
+
+    if unknown_keys:
+
+        raise RuntimeError(
+            f"В annotation обнаружены "
+            f"лишние ключи: "
+            f"{unknown_keys}"
+        )
+
+
+    assert (
+        ann[
+            "image_id"
+        ]
+        in
+        image_ids
+    )
+
+
+    assert (
+        ann[
+            "category_id"
+        ]
+        in
+        category_ids
+    )
+
+
+    assert (
+        len(
+            ann[
+                "bbox"
+            ]
+        )
+        ==
+        4
+    )
+
+
+    assert (
+        ann[
+            "bbox"
+        ][2]
+        >
+        0
+    )
+
+
+    assert (
+        ann[
+            "bbox"
+        ][3]
+        >
+        0
+    )
+
+
+    annotation_ids.append(
+        ann[
+            "id"
+        ]
+    )
+
+
+if (
+    len(annotation_ids)
+    !=
+    len(
+        set(
+            annotation_ids
+        )
+    )
+):
+
+    raise RuntimeError(
+        "Есть повторяющиеся annotation id."
+    )
+
+
+print(
+    "✓ COCO structure valid"
+)
+
+
+# ======================================================================
+# 20. СОХРАНЯЕМ СНАЧАЛА В /content
+#
+# Чтобы не делать сотни записей на Google Drive.
+# ======================================================================
+
+LOCAL_JSON = (
+    LOCAL_ROOT
+    /
+    "instances_cvat.json"
+)
+
+
+with open(
+    LOCAL_JSON,
+    "w",
+    encoding="utf-8"
+) as f:
+
+    json.dump(
+        coco,
+        f,
+        ensure_ascii=False,
+        indent=2,
+        allow_nan=False
+    )
+
+
+# ======================================================================
+# 21. ФИНАЛЬНАЯ ПРОВЕРКА ЧТЕНИЯ JSON
+# ======================================================================
+
+with open(
+    LOCAL_JSON,
+    "r",
+    encoding="utf-8"
+) as f:
+
+    test_json = (
+        json.load(
+            f
+        )
+    )
+
+
+assert (
+    set(
+        test_json.keys()
+    )
+    ==
+    {
+        "images",
+        "annotations",
+        "categories"
+    }
+)
+
+
+print(
+    "✓ JSON serialization valid"
+)
+
+
+# ======================================================================
+# 22. ОДНА ЗАПИСЬ НА GOOGLE DRIVE
+# ======================================================================
+
+shutil.copy2(
+    LOCAL_JSON,
+    FINAL_JSON
+)
+
+
+if not FINAL_JSON.is_file():
+
+    raise RuntimeError(
+        "Не удалось сохранить итоговый JSON."
+    )
+
+
+# ======================================================================
+# 23. RESULT
+# ======================================================================
+
+print("\n" + "=" * 76)
+
+print(
+    "INFERENCE COMPLETE"
+)
+
+print("=" * 76)
+
+
+print(
+    "Images processed          :",
+    len(
+        coco[
+            "images"
+        ]
+    )
+)
+
+
+print(
+    "Total annotations         :",
+    total_detections
+)
+
+
+print(
+    "Images with 0 detections  :",
+    count_0
+)
+
+
+print(
+    "Images with 1 detection   :",
+    count_1
+)
+
+
+print(
+    "Images with 2 detections  :",
+    count_2
+)
+
+
+print(
+    "Images with >2 detections :",
+    count_more_2
+)
+
+
+print(
+    "\nThreshold:",
+    SCORE_THRESHOLD
+)
+
+
+print(
+    "Top-2 mode:",
+    KEEP_ONLY_TOP_2
+)
+
+
+print(
+    "\nCVAT JSON:"
+)
+
+print(
+    FINAL_JSON
+)
+
+
+print("\nClasses:")
+
+for category in coco[
+    "categories"
+]:
+
+    print(
+        f"  {category['id']} -> "
+        f"{category['name']}"
+    )
+
+
+print(
+    "\nГотово для:"
+)
+
+print(
+    "CVAT -> Upload annotations -> COCO 1.0"
+)
+
+print("=" * 76)
+
+
+# ======================================================================
+# 24. CLEAN TEMP FILES
+# ======================================================================
+
+try:
+
+    del model
+
+except Exception:
+
+    pass
+
+
+gc.collect()
+
+
+if torch.cuda.is_available():
+
+    torch.cuda.empty_cache()
+
+
+shutil.rmtree(
+    LOCAL_ROOT,
+    ignore_errors=True
+)
+
+
+print(
+    "\n✓ Temporary /content files removed"
+)
