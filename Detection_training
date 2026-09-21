@@ -1,0 +1,3339 @@
+# ======================================================================
+# DINO 5-SCALE + SWIN-L
+# ARM-WRESTLING DETECTION
+#
+# 4 DRIVE PATHS:
+#   1. TRAIN_DRIVE   -> исходный train
+#   2. VAL_DRIVE     -> исходный val
+#   3. FINAL_DRIVE   -> финальный BEST один раз после всего обучения
+#   4. RESUME_DRIVE  -> полные resume checkpoints каждые N эпох
+#
+# DATASET во время обучения работает из /content.
+# ======================================================================
+
+from google.colab import drive
+drive.mount("/content/drive")
+
+import os
+import re
+import sys
+import gc
+import json
+import math
+import random
+import shutil
+import subprocess
+
+from pathlib import Path, PurePosixPath
+from datetime import datetime
+from collections import Counter, defaultdict
+
+import numpy as np
+import torch
+
+import mmcv
+import mmengine
+import mmdet
+
+from mmengine.config import Config
+from mmengine.runner import Runner
+from mmengine.evaluator import BaseMetric
+from mmengine.visualization import Visualizer
+from mmengine.logging import MMLogger, MessageHub
+from mmengine.hooks import Hook
+from mmengine.registry import HOOKS
+
+from mmdet.registry import METRICS
+
+
+# ======================================================================
+# 1. ПУТИ
+# ======================================================================
+
+# TRAIN:
+#   images/
+#   annotations/*.json
+TRAIN_DRIVE = Path(
+    "/content/drive/MyDrive/Да_да_да/Detection/Train"
+)
+
+# VAL:
+#   images/
+#   annotations/*.json
+VAL_DRIVE = Path(
+    "/content/drive/MyDrive/Да_да_да/Detection/Val"
+)
+
+# ------------------------------------------------------------
+# ФИНАЛЬНЫЙ ПУТЬ
+#
+# Сюда после завершения всего обучения попадут:
+#
+# best_dino_swin_l_map50_95.pth
+# best_metrics.json
+# dino_swin_l_arm_config.py
+#
+# То есть обычный "боевой" best checkpoint.
+# ------------------------------------------------------------
+
+FINAL_DRIVE = Path(
+    "/content/drive/MyDrive/Да_да_да/Detection/Weights"
+)
+
+# ------------------------------------------------------------
+# НОВЫЙ ПУТЬ ДЛЯ RESUME
+#
+# Каждые N эпох:
+#
+# resume_epoch_005.pth
+# resume_epoch_010.pth
+# ...
+#
+# + best_so_far.pth
+# + resume_info.json
+# ------------------------------------------------------------
+
+RESUME_DRIVE = Path(
+    "/content/drive/MyDrive/Да_да_да/Detection/Resume"
+)
+
+
+# ======================================================================
+# 2. ЛОКАЛЬНЫЕ ПУТИ
+# ======================================================================
+
+LOCAL_DATA_ROOT = Path(
+    "/content/armwrestling_dino"
+)
+
+TRAIN_ROOT = (
+    LOCAL_DATA_ROOT / "train"
+)
+
+VAL_ROOT = (
+    LOCAL_DATA_ROOT / "val"
+)
+
+LOCAL_RUN_ROOT = Path(
+    "/content/dino_runs"
+)
+
+
+# ======================================================================
+# 3. ГИПЕРПАРАМЕТРЫ
+# ======================================================================
+
+MAX_EPOCHS = 36
+
+# У тебя batch=8 помещался примерно в 12 / 15 GB VRAM
+BATCH_SIZE = 8
+
+GRAD_ACCUMULATION = 1
+
+LEARNING_RATE = 2.5e-5
+
+BACKBONE_LR_MULT = 0.1
+
+WEIGHT_DECAY = 1e-4
+
+GRAD_CLIP = 0.1
+
+USE_AMP = True
+
+
+# ------------------------------------------------------------
+# DATA LOADER
+# ------------------------------------------------------------
+
+NUM_WORKERS = 2
+
+PERSISTENT_WORKERS = True
+
+PIN_MEMORY = True
+
+
+# ------------------------------------------------------------
+# INPUT
+# ------------------------------------------------------------
+
+TRAIN_SCALES = [
+    (224, 224),
+    (256, 256),
+    (288, 288),
+]
+
+VAL_SCALE = (
+    256,
+    256
+)
+
+
+# ------------------------------------------------------------
+# DINO
+# ------------------------------------------------------------
+
+NUM_QUERIES = 900
+
+MAX_DETECTIONS = 100
+
+# Gradient checkpointing Swin-L
+WITH_CP = True
+
+
+# ------------------------------------------------------------
+# METRICS
+# ------------------------------------------------------------
+
+SCORE_THRESHOLD = 0.25
+
+MATCH_IOU = 0.50
+
+
+# ------------------------------------------------------------
+# CLASSES
+# ------------------------------------------------------------
+
+CLASSES = (
+    "Toproll",
+    "Hook",
+    "Press",
+    "Kingsmove",
+)
+
+
+# ======================================================================
+# 4. RESUME SETTINGS
+# ======================================================================
+
+# Полный checkpoint каждые N эпох.
+#
+# Например:
+#
+# 5 -> эпохи 5, 10, 15, 20...
+SAVE_RESUME_EVERY_N_EPOCHS = 5
+
+# Сколько ПОЛНЫХ resume checkpoints хранить на Drive.
+#
+# 2 означает:
+#
+# после epoch 15:
+# resume_epoch_005 удаляется
+#
+# остаются:
+# resume_epoch_010
+# resume_epoch_015
+#
+# Очень важно, потому что optimizer state делает checkpoint большим.
+KEEP_LAST_RESUME_CHECKPOINTS = 2
+
+# Если True:
+#
+# при новом запуске скрипт автоматически ищет последний
+# resume_epoch_XXX.pth и продолжает с него.
+AUTO_RESUME = True
+
+# Если False:
+#
+# даже если checkpoints существуют,
+# обучение начнётся с нуля.
+FORCE_START_FROM_SCRATCH = False
+
+
+# ======================================================================
+# 5. ПРОЧЕЕ
+# ======================================================================
+
+SEED = 42
+
+# После ПОЛНОСТЬЮ успешного обучения удаляем /content dataset/run.
+# Drive не затрагивается.
+CLEAN_LOCAL_AFTER_FINISH = True
+
+
+# ======================================================================
+# 6. ENVIRONMENT CHECK
+# ======================================================================
+
+print("=" * 78)
+print("ENVIRONMENT")
+print("=" * 78)
+
+print(
+    "Python       :",
+    sys.version.split()[0]
+)
+
+print(
+    "NumPy        :",
+    np.__version__
+)
+
+print(
+    "PyTorch      :",
+    torch.__version__
+)
+
+print(
+    "CUDA         :",
+    torch.version.cuda
+)
+
+print(
+    "MMCV         :",
+    mmcv.__version__
+)
+
+print(
+    "MMEngine     :",
+    mmengine.__version__
+)
+
+print(
+    "MMDetection  :",
+    mmdet.__version__
+)
+
+print(
+    "GPU          :",
+    torch.cuda.get_device_name(0)
+    if torch.cuda.is_available()
+    else "NO GPU"
+)
+
+assert torch.cuda.is_available()
+
+assert np.__version__.startswith(
+    "1.26"
+)
+
+assert mmcv.__version__ == "2.1.0"
+
+assert mmdet.__version__ == "3.3.0"
+
+
+# ======================================================================
+# 7. SEED
+# ======================================================================
+
+random.seed(SEED)
+
+np.random.seed(SEED)
+
+torch.manual_seed(SEED)
+
+torch.cuda.manual_seed_all(SEED)
+
+
+# ======================================================================
+# 8. СОЗДАЁМ DRIVE DIRECTORIES
+# ======================================================================
+
+FINAL_DRIVE.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+RESUME_DRIVE.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+# ======================================================================
+# 9. НЕМНОГО ОСВОБОЖДАЕМ LOCAL DISK
+# ======================================================================
+
+print("\nCleaning pip cache...")
+
+subprocess.run(
+    [
+        sys.executable,
+        "-m",
+        "pip",
+        "cache",
+        "purge"
+    ],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    check=False
+)
+
+
+# ======================================================================
+# 10. УДАЛЯЕМ СТАРЫЕ LOCAL DATA/RUN
+#
+# Google Drive НЕ трогаем.
+# ======================================================================
+
+if LOCAL_DATA_ROOT.exists():
+
+    shutil.rmtree(
+        LOCAL_DATA_ROOT,
+        ignore_errors=True
+    )
+
+
+if LOCAL_RUN_ROOT.exists():
+
+    shutil.rmtree(
+        LOCAL_RUN_ROOT,
+        ignore_errors=True
+    )
+
+
+LOCAL_DATA_ROOT.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+LOCAL_RUN_ROOT.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+# ======================================================================
+# 11. ПРОВЕРКА SOURCE DATASET
+# ======================================================================
+
+for path in [
+    TRAIN_DRIVE / "images",
+    TRAIN_DRIVE / "annotations",
+    VAL_DRIVE / "images",
+    VAL_DRIVE / "annotations",
+]:
+
+    if not path.exists():
+
+        raise FileNotFoundError(
+            f"Не найдено:\n{path}"
+        )
+
+
+# ======================================================================
+# 12. DRIVE -> /content
+#
+# Во время обучения Drive больше не используется для чтения jpg.
+# ======================================================================
+
+print("\n" + "=" * 78)
+print("COPY DATASET FROM DRIVE TO /content")
+print("=" * 78)
+
+
+print("\nCopy TRAIN...")
+
+shutil.copytree(
+    TRAIN_DRIVE,
+    TRAIN_ROOT
+)
+
+print("✓ TRAIN copied")
+
+
+print("\nCopy VAL...")
+
+shutil.copytree(
+    VAL_DRIVE,
+    VAL_ROOT
+)
+
+print("✓ VAL copied")
+
+
+# ======================================================================
+# 13. FIND COCO JSON
+# ======================================================================
+
+def find_coco_json(root):
+
+    ann_dir = (
+        root / "annotations"
+    )
+
+    candidates = []
+
+    for p in ann_dir.rglob(
+        "*.json"
+    ):
+
+        stem = (
+            p.stem.lower()
+        )
+
+        # backup/fixed не считаем рабочим JSON
+        if "backup" in stem:
+            continue
+
+        if "fixed" in stem:
+            continue
+
+        try:
+
+            with open(
+                p,
+                "r",
+                encoding="utf-8"
+            ) as f:
+
+                data = json.load(f)
+
+            if (
+                isinstance(data, dict)
+                and
+                "images" in data
+                and
+                "annotations" in data
+                and
+                "categories" in data
+            ):
+
+                candidates.append(
+                    p
+                )
+
+        except Exception:
+
+            pass
+
+
+    if len(candidates) == 0:
+
+        raise FileNotFoundError(
+            f"COCO JSON не найден:\n{ann_dir}"
+        )
+
+
+    if len(candidates) > 1:
+
+        print(
+            "\nНайдено несколько рабочих JSON:"
+        )
+
+        for p in candidates:
+            print(" ", p)
+
+        raise RuntimeError(
+            "В annotations должен быть один рабочий COCO JSON."
+        )
+
+
+    return candidates[0]
+
+
+TRAIN_JSON_ORIGINAL = (
+    find_coco_json(
+        TRAIN_ROOT
+    )
+)
+
+VAL_JSON_ORIGINAL = (
+    find_coco_json(
+        VAL_ROOT
+    )
+)
+
+
+print("\nTRAIN JSON:")
+print(TRAIN_JSON_ORIGINAL)
+
+print("\nVAL JSON:")
+print(VAL_JSON_ORIGINAL)
+
+
+# ======================================================================
+# 14. LOCAL RUN
+# ======================================================================
+
+RUN_NAME = datetime.now().strftime(
+    "run_%Y%m%d_%H%M%S"
+)
+
+RUN_DIR = (
+    LOCAL_RUN_ROOT
+    / RUN_NAME
+)
+
+RUN_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+# ======================================================================
+# 15. NORMALIZE COCO
+#
+# classification_validation/hook_001.jpg
+#
+# ->
+#
+# hook_001.jpg
+# ======================================================================
+
+def prepare_coco_json(
+    root,
+    source_json,
+    output_json
+):
+
+    images_dir = (
+        root / "images"
+    )
+
+    with open(
+        source_json,
+        "r",
+        encoding="utf-8"
+    ) as f:
+
+        data = json.load(f)
+
+
+    # ----------------------------------------------------------
+    # CLASSES
+    # ----------------------------------------------------------
+
+    canonical = {
+
+        cls.lower(): cls
+
+        for cls in CLASSES
+    }
+
+    categories = {}
+
+
+    for cat in data[
+        "categories"
+    ]:
+
+        name = (
+            str(
+                cat["name"]
+            )
+            .strip()
+            .lower()
+        )
+
+        if name not in canonical:
+
+            raise ValueError(
+                f"Неизвестный класс: {cat['name']}"
+            )
+
+        cat["name"] = (
+            canonical[name]
+        )
+
+        categories[
+            name
+        ] = cat
+
+
+    missing_classes = [
+
+        cls
+
+        for cls in CLASSES
+
+        if cls.lower()
+        not in categories
+    ]
+
+
+    if missing_classes:
+
+        raise ValueError(
+            f"Нет классов: {missing_classes}"
+        )
+
+
+    # Фиксируем порядок label:
+    #
+    # 0 Toproll
+    # 1 Hook
+    # 2 Press
+    # 3 Kingsmove
+
+    data["categories"] = [
+
+        categories[
+            cls.lower()
+        ]
+
+        for cls in CLASSES
+    ]
+
+
+    # ----------------------------------------------------------
+    # FILE_NAME
+    # ----------------------------------------------------------
+
+    fixed = 0
+
+    missing = []
+
+
+    for image in data[
+        "images"
+    ]:
+
+        old = str(
+            image["file_name"]
+        ).replace(
+            "\\",
+            "/"
+        )
+
+        parts = (
+            PurePosixPath(
+                old
+            ).parts
+        )
+
+        found = None
+
+
+        for start in range(
+            len(parts)
+        ):
+
+            relative = Path(
+                *parts[start:]
+            )
+
+            candidate = (
+                images_dir
+                / relative
+            )
+
+            if candidate.is_file():
+
+                found = (
+                    relative
+                    .as_posix()
+                )
+
+                break
+
+
+        if found is None:
+
+            missing.append(
+                old
+            )
+
+            continue
+
+
+        if found != old:
+
+            fixed += 1
+
+
+        image[
+            "file_name"
+        ] = found
+
+
+    if missing:
+
+        print(
+            "\nMissing:",
+            len(missing)
+        )
+
+        for x in missing[:20]:
+            print(x)
+
+        raise FileNotFoundError(
+            "Некоторые изображения из JSON не найдены."
+        )
+
+
+    # ----------------------------------------------------------
+    # 2 BBOX CHECK
+    # ----------------------------------------------------------
+
+    counts = Counter()
+
+
+    for ann in data[
+        "annotations"
+    ]:
+
+        if not ann.get(
+            "iscrowd",
+            0
+        ):
+
+            counts[
+                ann["image_id"]
+            ] += 1
+
+
+    wrong = []
+
+
+    for image in data[
+        "images"
+    ]:
+
+        n = counts[
+            image["id"]
+        ]
+
+        if n != 2:
+
+            wrong.append(
+                (
+                    image["id"],
+                    n
+                )
+            )
+
+
+    print("\nDataset:", root)
+
+    print(
+        "Images      :",
+        len(
+            data["images"]
+        )
+    )
+
+    print(
+        "Annotations :",
+        len(
+            data["annotations"]
+        )
+    )
+
+    print(
+        "Fixed paths :",
+        fixed
+    )
+
+
+    if wrong:
+
+        print(
+            "WARNING: не 2 bbox:",
+            len(wrong)
+        )
+
+        print(
+            wrong[:10]
+        )
+
+    else:
+
+        print(
+            "✓ у каждого изображения ровно 2 bbox"
+        )
+
+
+    with open(
+        output_json,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            data,
+            f,
+            ensure_ascii=False
+        )
+
+
+    return data
+
+
+TRAIN_JSON = (
+    RUN_DIR
+    / "train_fixed.json"
+)
+
+VAL_JSON = (
+    RUN_DIR
+    / "val_fixed.json"
+)
+
+
+train_coco = (
+    prepare_coco_json(
+        TRAIN_ROOT,
+        TRAIN_JSON_ORIGINAL,
+        TRAIN_JSON
+    )
+)
+
+val_coco = (
+    prepare_coco_json(
+        VAL_ROOT,
+        VAL_JSON_ORIGINAL,
+        VAL_JSON
+    )
+)
+
+
+# ======================================================================
+# 16. CUSTOM METRIC
+# ======================================================================
+
+def to_numpy(x):
+
+    if hasattr(
+        x,
+        "tensor"
+    ):
+        x = x.tensor
+
+    if hasattr(
+        x,
+        "detach"
+    ):
+        x = x.detach()
+
+    if hasattr(
+        x,
+        "cpu"
+    ):
+        x = x.cpu()
+
+    if hasattr(
+        x,
+        "numpy"
+    ):
+        x = x.numpy()
+
+    return np.asarray(
+        x
+    )
+
+
+def iou_matrix(
+    boxes1,
+    boxes2
+):
+
+    boxes1 = np.asarray(
+        boxes1,
+        dtype=np.float32
+    ).reshape(
+        -1,
+        4
+    )
+
+    boxes2 = np.asarray(
+        boxes2,
+        dtype=np.float32
+    ).reshape(
+        -1,
+        4
+    )
+
+
+    if (
+        len(boxes1) == 0
+        or
+        len(boxes2) == 0
+    ):
+
+        return np.zeros(
+            (
+                len(boxes1),
+                len(boxes2)
+            ),
+            dtype=np.float32
+        )
+
+
+    lt = np.maximum(
+        boxes1[
+            :,
+            None,
+            :2
+        ],
+        boxes2[
+            None,
+            :,
+            :2
+        ]
+    )
+
+
+    rb = np.minimum(
+        boxes1[
+            :,
+            None,
+            2:
+        ],
+        boxes2[
+            None,
+            :,
+            2:
+        ]
+    )
+
+
+    wh = np.clip(
+        rb - lt,
+        0,
+        None
+    )
+
+
+    intersection = (
+        wh[..., 0]
+        *
+        wh[..., 1]
+    )
+
+
+    area1 = (
+        np.clip(
+            boxes1[:, 2]
+            -
+            boxes1[:, 0],
+            0,
+            None
+        )
+        *
+        np.clip(
+            boxes1[:, 3]
+            -
+            boxes1[:, 1],
+            0,
+            None
+        )
+    )
+
+
+    area2 = (
+        np.clip(
+            boxes2[:, 2]
+            -
+            boxes2[:, 0],
+            0,
+            None
+        )
+        *
+        np.clip(
+            boxes2[:, 3]
+            -
+            boxes2[:, 1],
+            0,
+            None
+        )
+    )
+
+
+    union = (
+        area1[:, None]
+        +
+        area2[None, :]
+        -
+        intersection
+    )
+
+
+    return (
+        intersection
+        /
+        np.maximum(
+            union,
+            1e-9
+        )
+    )
+
+
+@METRICS.register_module(
+    force=True
+)
+class TwoAthleteMetric(
+    BaseMetric
+):
+
+    default_prefix = "arm"
+
+
+    def __init__(
+        self,
+        ann_file,
+        classes,
+        score_thr=0.25,
+        iou_thr=0.50,
+        collect_device="cpu",
+        prefix=None
+    ):
+
+        super().__init__(
+            collect_device=collect_device,
+            prefix=prefix
+        )
+
+
+        self.score_thr = float(
+            score_thr
+        )
+
+        self.iou_thr = float(
+            iou_thr
+        )
+
+        self.classes = tuple(
+            classes
+        )
+
+
+        with open(
+            ann_file,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            coco = json.load(
+                f
+            )
+
+
+        name_to_label = {
+
+            name.lower(): index
+
+            for index, name
+            in enumerate(
+                self.classes
+            )
+        }
+
+
+        category_to_label = {}
+
+
+        for category in coco[
+            "categories"
+        ]:
+
+            category_to_label[
+                int(
+                    category[
+                        "id"
+                    ]
+                )
+            ] = (
+                name_to_label[
+                    category[
+                        "name"
+                    ].lower()
+                ]
+            )
+
+
+        self.gt = defaultdict(
+            lambda: {
+                "boxes": [],
+                "labels": []
+            }
+        )
+
+
+        for ann in coco[
+            "annotations"
+        ]:
+
+            if ann.get(
+                "iscrowd",
+                0
+            ):
+                continue
+
+            if ann.get(
+                "ignore",
+                False
+            ):
+                continue
+
+
+            x, y, w, h = (
+                ann[
+                    "bbox"
+                ]
+            )
+
+            image_id = int(
+                ann[
+                    "image_id"
+                ]
+            )
+
+
+            self.gt[
+                image_id
+            ][
+                "boxes"
+            ].append(
+                [
+                    x,
+                    y,
+                    x + w,
+                    y + h
+                ]
+            )
+
+
+            self.gt[
+                image_id
+            ][
+                "labels"
+            ].append(
+                category_to_label[
+                    int(
+                        ann[
+                            "category_id"
+                        ]
+                    )
+                ]
+            )
+
+
+    def process(
+        self,
+        data_batch,
+        data_samples
+    ):
+
+        for sample in data_samples:
+
+            pred = sample[
+                "pred_instances"
+            ]
+
+            image_id = int(
+                sample[
+                    "img_id"
+                ]
+            )
+
+
+            pred_boxes = to_numpy(
+                pred[
+                    "bboxes"
+                ]
+            )
+
+            pred_scores = to_numpy(
+                pred[
+                    "scores"
+                ]
+            )
+
+            pred_labels = to_numpy(
+                pred[
+                    "labels"
+                ]
+            ).astype(
+                np.int64
+            )
+
+
+            gt_info = self.gt[
+                image_id
+            ]
+
+
+            gt_boxes = np.asarray(
+                gt_info[
+                    "boxes"
+                ],
+                dtype=np.float32
+            ).reshape(
+                -1,
+                4
+            )
+
+            gt_labels = np.asarray(
+                gt_info[
+                    "labels"
+                ],
+                dtype=np.int64
+            )
+
+
+            self.results.append(
+                dict(
+                    pred_boxes=pred_boxes,
+                    pred_scores=pred_scores,
+                    pred_labels=pred_labels,
+
+                    gt_boxes=gt_boxes,
+                    gt_labels=gt_labels
+                )
+            )
+
+
+    def compute_metrics(
+        self,
+        results
+    ):
+
+        TP = 0
+        FP = 0
+        FN = 0
+
+        localized_total = 0
+
+        technique_correct = 0
+
+        both_correct_images = 0
+
+        total_images = len(
+            results
+        )
+
+
+        for result in results:
+
+            pb = result[
+                "pred_boxes"
+            ]
+
+            ps = result[
+                "pred_scores"
+            ]
+
+            pl = result[
+                "pred_labels"
+            ]
+
+            gb = result[
+                "gt_boxes"
+            ]
+
+            gl = result[
+                "gt_labels"
+            ]
+
+
+            keep = (
+                ps
+                >=
+                self.score_thr
+            )
+
+
+            pb = pb[
+                keep
+            ]
+
+            ps = ps[
+                keep
+            ]
+
+            pl = pl[
+                keep
+            ]
+
+
+            if len(
+                ps
+            ):
+
+                order = (
+                    np.argsort(
+                        -ps
+                    )
+                )
+
+                pb = pb[
+                    order
+                ]
+
+                ps = ps[
+                    order
+                ]
+
+                pl = pl[
+                    order
+                ]
+
+
+            ious = (
+                iou_matrix(
+                    pb,
+                    gb
+                )
+            )
+
+
+            # --------------------------------------------------
+            # Precision / Recall
+            # --------------------------------------------------
+
+            matched_gt = set()
+
+
+            for pi in range(
+                len(pb)
+            ):
+
+                candidates = [
+
+                    gi
+
+                    for gi in range(
+                        len(gb)
+                    )
+
+                    if (
+                        gi not in matched_gt
+                        and
+                        pl[pi]
+                        ==
+                        gl[gi]
+                    )
+                ]
+
+
+                if not candidates:
+
+                    FP += 1
+
+                    continue
+
+
+                candidate_ious = (
+                    ious[
+                        pi,
+                        candidates
+                    ]
+                )
+
+
+                best_pos = int(
+                    np.argmax(
+                        candidate_ious
+                    )
+                )
+
+                best_gt = (
+                    candidates[
+                        best_pos
+                    ]
+                )
+
+                best_iou = (
+                    candidate_ious[
+                        best_pos
+                    ]
+                )
+
+
+                if (
+                    best_iou
+                    >=
+                    self.iou_thr
+                ):
+
+                    TP += 1
+
+                    matched_gt.add(
+                        best_gt
+                    )
+
+                else:
+
+                    FP += 1
+
+
+            FN += (
+                len(gb)
+                -
+                len(
+                    matched_gt
+                )
+            )
+
+
+            # --------------------------------------------------
+            # Technique Accuracy
+            # --------------------------------------------------
+
+            pairs = []
+
+
+            for pi in range(
+                len(pb)
+            ):
+
+                for gi in range(
+                    len(gb)
+                ):
+
+                    current_iou = (
+                        ious[
+                            pi,
+                            gi
+                        ]
+                    )
+
+
+                    if (
+                        current_iou
+                        >=
+                        self.iou_thr
+                    ):
+
+                        pairs.append(
+                            (
+                                float(
+                                    current_iou
+                                ),
+                                pi,
+                                gi
+                            )
+                        )
+
+
+            pairs.sort(
+                key=lambda x:
+                    x[0],
+                reverse=True
+            )
+
+
+            used_pred = set()
+
+            used_gt = set()
+
+            selected = []
+
+
+            for _, pi, gi in pairs:
+
+                if pi in used_pred:
+                    continue
+
+                if gi in used_gt:
+                    continue
+
+
+                used_pred.add(
+                    pi
+                )
+
+                used_gt.add(
+                    gi
+                )
+
+
+                selected.append(
+                    (
+                        pi,
+                        gi
+                    )
+                )
+
+
+            localized_total += len(
+                selected
+            )
+
+
+            correct_this_image = 0
+
+
+            for pi, gi in selected:
+
+                if (
+                    pl[pi]
+                    ==
+                    gl[gi]
+                ):
+
+                    technique_correct += 1
+
+                    correct_this_image += 1
+
+
+            if (
+                len(gb) == 2
+                and
+                len(selected) == 2
+                and
+                correct_this_image == 2
+            ):
+
+                both_correct_images += 1
+
+
+        precision = (
+            TP / (TP + FP)
+
+            if TP + FP > 0
+
+            else 0.0
+        )
+
+
+        recall = (
+            TP / (TP + FN)
+
+            if TP + FN > 0
+
+            else 0.0
+        )
+
+
+        technique_accuracy = (
+            technique_correct
+            /
+            localized_total
+
+            if localized_total > 0
+
+            else 0.0
+        )
+
+
+        both_correct_pct = (
+            100.0
+            *
+            both_correct_images
+            /
+            total_images
+
+            if total_images > 0
+
+            else 0.0
+        )
+
+
+        return {
+            "precision":
+                float(
+                    precision
+                ),
+
+            "recall":
+                float(
+                    recall
+                ),
+
+            "technique_accuracy":
+                float(
+                    technique_accuracy
+                ),
+
+            "both_correct_pct":
+                float(
+                    both_correct_pct
+                ),
+        }
+
+
+# ======================================================================
+# 17. RESUME CHECKPOINT HOOK
+#
+# Работает ПОСЛЕ validation.
+#
+# Каждые N эпох:
+#
+# 1. full state -> resume_epoch_XXX.pth
+# 2. best weights -> best_so_far.pth
+# 3. metadata -> resume_info.json
+# 4. старые full checkpoints удаляются
+#
+# priority LOWEST:
+# сначала стандартный CheckpointHook успевает обновить BEST mAP.
+# ======================================================================
+
+@HOOKS.register_module(
+    force=True
+)
+class PeriodicDriveResumeHook(
+    Hook
+):
+
+    priority = "LOWEST"
+
+
+    def __init__(
+        self,
+        out_dir,
+        interval=5,
+        keep_last=2,
+        metric_key="coco/bbox_mAP"
+    ):
+
+        self.out_dir = Path(
+            out_dir
+        )
+
+        self.interval = int(
+            interval
+        )
+
+        self.keep_last = int(
+            keep_last
+        )
+
+        self.metric_key = (
+            metric_key
+        )
+
+        self.out_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+
+    def _checkpoint_epoch(
+        self,
+        path
+    ):
+
+        match = re.search(
+            r"resume_epoch_(\d+)\.pth$",
+            path.name
+        )
+
+        if match:
+
+            return int(
+                match.group(1)
+            )
+
+        return -1
+
+
+    def _cleanup_old(
+        self
+    ):
+
+        if self.keep_last <= 0:
+            return
+
+
+        checkpoints = sorted(
+            self.out_dir.glob(
+                "resume_epoch_*.pth"
+            ),
+            key=self._checkpoint_epoch
+        )
+
+
+        while (
+            len(checkpoints)
+            >
+            self.keep_last
+        ):
+
+            old = checkpoints.pop(
+                0
+            )
+
+            try:
+
+                old.unlink()
+
+                print(
+                    f"Removed old resume checkpoint: {old}"
+                )
+
+            except Exception as e:
+
+                print(
+                    "WARNING: cannot remove",
+                    old,
+                    e
+                )
+
+
+    def after_val_epoch(
+        self,
+        runner,
+        metrics=None
+    ):
+
+        # После run_epoch MMEngine уже увеличил epoch.
+        completed_epoch = int(
+            runner.epoch
+        )
+
+
+        if completed_epoch <= 0:
+            return
+
+
+        if (
+            completed_epoch
+            %
+            self.interval
+            != 0
+        ):
+
+            return
+
+
+        self.out_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+
+        # ------------------------------------------------------
+        # METRICS
+        # ------------------------------------------------------
+
+        metrics = (
+            metrics
+            if metrics is not None
+            else {}
+        )
+
+
+        current_map = metrics.get(
+            self.metric_key,
+            None
+        )
+
+
+        best_score = None
+
+
+        if (
+            "best_score"
+            in
+            runner.message_hub.runtime_info
+        ):
+
+            try:
+
+                best_score = float(
+                    runner.message_hub.get_info(
+                        "best_score"
+                    )
+                )
+
+            except Exception:
+
+                best_score = None
+
+
+        # ------------------------------------------------------
+        # FULL TRAINING STATE
+        # ------------------------------------------------------
+
+        filename = (
+            f"resume_epoch_"
+            f"{completed_epoch:03d}.pth"
+        )
+
+
+        print("\n" + "=" * 78)
+
+        print(
+            f"SAVING FULL RESUME CHECKPOINT: "
+            f"EPOCH {completed_epoch}"
+        )
+
+        print("=" * 78)
+
+
+        meta = dict(
+
+            epoch=completed_epoch,
+
+            iter=int(
+                runner.iter
+            ),
+
+            resume_epoch=completed_epoch,
+
+            current_map50_95=(
+                float(current_map)
+                if current_map is not None
+                else None
+            ),
+
+            best_map50_95=(
+                best_score
+            ),
+
+            saved_at=(
+                datetime.now()
+                .isoformat()
+            )
+        )
+
+
+        # ВАЖНО:
+        #
+        # save_optimizer=True
+        # save_param_scheduler=True
+        #
+        # Поэтому resume продолжает реальное обучение,
+        # а не просто загружает веса.
+
+        runner.save_checkpoint(
+
+            out_dir=str(
+                self.out_dir
+            ),
+
+            filename=filename,
+
+            save_optimizer=True,
+
+            save_param_scheduler=True,
+
+            meta=meta,
+
+            by_epoch=True
+        )
+
+
+        full_path = (
+            self.out_dir
+            /
+            filename
+        )
+
+
+        print(
+            "\n✓ Full training state saved:"
+        )
+
+        print(
+            full_path
+        )
+
+
+        # ------------------------------------------------------
+        # BEST WEIGHTS SO FAR
+        #
+        # Стандартный CheckpointHook к этому моменту уже определил
+        # лучший mAP и сохранил local best.
+        # ------------------------------------------------------
+
+        best_ckpt_path = None
+
+
+        if (
+            "best_ckpt"
+            in
+            runner.message_hub.runtime_info
+        ):
+
+            try:
+
+                best_ckpt_path = Path(
+                    runner.message_hub.get_info(
+                        "best_ckpt"
+                    )
+                )
+
+            except Exception:
+
+                best_ckpt_path = None
+
+
+        BEST_SO_FAR = (
+            self.out_dir
+            /
+            "best_so_far.pth"
+        )
+
+
+        if (
+            best_ckpt_path is not None
+            and
+            best_ckpt_path.is_file()
+        ):
+
+            shutil.copy2(
+                best_ckpt_path,
+                BEST_SO_FAR
+            )
+
+            print(
+                "\n✓ Current BEST weights copied:"
+            )
+
+            print(
+                BEST_SO_FAR
+            )
+
+        elif BEST_SO_FAR.exists():
+
+            # На resume-run предыдущий best может находиться
+            # уже только на Drive.
+            #
+            # Его не удаляем/не заменяем.
+            print(
+                "\n✓ Existing best_so_far preserved:"
+            )
+
+            print(
+                BEST_SO_FAR
+            )
+
+
+        # ------------------------------------------------------
+        # JSON INFO
+        # ------------------------------------------------------
+
+        info = dict(
+
+            latest_resume_checkpoint=str(
+                full_path
+            ),
+
+            completed_epoch=completed_epoch,
+
+            iteration=int(
+                runner.iter
+            ),
+
+            current_map50_95=(
+                float(current_map)
+                if current_map is not None
+                else None
+            ),
+
+            best_map50_95=(
+                best_score
+            ),
+
+            best_weights=str(
+                BEST_SO_FAR
+            )
+            if BEST_SO_FAR.exists()
+            else None,
+
+            max_epochs=int(
+                runner.max_epochs
+            ),
+
+            saved_at=(
+                datetime.now()
+                .isoformat()
+            )
+        )
+
+
+        INFO_PATH = (
+            self.out_dir
+            /
+            "resume_info.json"
+        )
+
+
+        with open(
+            INFO_PATH,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            json.dump(
+                info,
+                f,
+                ensure_ascii=False,
+                indent=2
+            )
+
+
+        # ------------------------------------------------------
+        # KEEP ONLY LAST N
+        # ------------------------------------------------------
+
+        self._cleanup_old()
+
+
+# ======================================================================
+# 18. ПОИСК ПОСЛЕДНЕГО RESUME CHECKPOINT
+# ======================================================================
+
+def find_latest_resume_checkpoint(
+    folder
+):
+
+    folder = Path(
+        folder
+    )
+
+    candidates = []
+
+
+    for path in folder.glob(
+        "resume_epoch_*.pth"
+    ):
+
+        match = re.search(
+            r"resume_epoch_(\d+)\.pth$",
+            path.name
+        )
+
+        if match:
+
+            candidates.append(
+                (
+                    int(
+                        match.group(1)
+                    ),
+                    path
+                )
+            )
+
+
+    if not candidates:
+
+        return None
+
+
+    candidates.sort(
+        key=lambda x:
+            x[0]
+    )
+
+
+    return candidates[
+        -1
+    ][1]
+
+
+LATEST_RESUME = (
+    find_latest_resume_checkpoint(
+        RESUME_DRIVE
+    )
+)
+
+
+# ======================================================================
+# 19. DINO CONFIG
+# ======================================================================
+
+MMDET_ROOT = Path(
+    "/content/mmdetection"
+)
+
+
+BASE_CONFIG = (
+    MMDET_ROOT
+    /
+    "configs"
+    /
+    "dino"
+    /
+    "dino-5scale_swin-l_8xb2-36e_coco.py"
+)
+
+
+if not BASE_CONFIG.exists():
+
+    raise FileNotFoundError(
+        BASE_CONFIG
+    )
+
+
+cfg = Config.fromfile(
+    str(
+        BASE_CONFIG
+    )
+)
+
+
+# ======================================================================
+# 20. MODEL
+# ======================================================================
+
+cfg.model.bbox_head.num_classes = (
+    len(
+        CLASSES
+    )
+)
+
+
+cfg.model.num_queries = (
+    NUM_QUERIES
+)
+
+
+cfg.model.test_cfg.max_per_img = (
+    MAX_DETECTIONS
+)
+
+
+cfg.model.backbone.with_cp = (
+    WITH_CP
+)
+
+
+# ======================================================================
+# 21. PIPELINES
+# ======================================================================
+
+train_pipeline = [
+
+    dict(
+        type="LoadImageFromFile"
+    ),
+
+    dict(
+        type="LoadAnnotations",
+        with_bbox=True
+    ),
+
+    dict(
+        type="RandomFlip",
+        prob=0.5
+    ),
+
+    dict(
+        type="RandomChoiceResize",
+        scales=TRAIN_SCALES,
+        keep_ratio=True
+    ),
+
+    dict(
+        type="PackDetInputs"
+    ),
+]
+
+
+val_pipeline = [
+
+    dict(
+        type="LoadImageFromFile"
+    ),
+
+    dict(
+        type="Resize",
+        scale=VAL_SCALE,
+        keep_ratio=True
+    ),
+
+    dict(
+        type="PackDetInputs",
+
+        meta_keys=(
+            "img_id",
+            "img_path",
+            "ori_shape",
+            "img_shape",
+            "scale_factor"
+        )
+    )
+]
+
+
+# ======================================================================
+# 22. DATALOADERS
+# ======================================================================
+
+cfg.train_dataloader = dict(
+
+    batch_size=BATCH_SIZE,
+
+    num_workers=NUM_WORKERS,
+
+    persistent_workers=(
+        PERSISTENT_WORKERS
+    ),
+
+    pin_memory=(
+        PIN_MEMORY
+    ),
+
+    drop_last=False,
+
+    sampler=dict(
+        type="DefaultSampler",
+        shuffle=True
+    ),
+
+    dataset=dict(
+
+        type="CocoDataset",
+
+        data_root="",
+
+        ann_file=str(
+            TRAIN_JSON
+        ),
+
+        data_prefix=dict(
+            img=(
+                str(
+                    TRAIN_ROOT
+                    /
+                    "images"
+                )
+                +
+                "/"
+            )
+        ),
+
+        metainfo=dict(
+            classes=CLASSES
+        ),
+
+        filter_cfg=dict(
+            filter_empty_gt=False,
+            min_size=1
+        ),
+
+        pipeline=(
+            train_pipeline
+        )
+    )
+)
+
+
+cfg.val_dataloader = dict(
+
+    batch_size=1,
+
+    num_workers=NUM_WORKERS,
+
+    persistent_workers=(
+        PERSISTENT_WORKERS
+    ),
+
+    pin_memory=(
+        PIN_MEMORY
+    ),
+
+    drop_last=False,
+
+    sampler=dict(
+        type="DefaultSampler",
+        shuffle=False
+    ),
+
+    dataset=dict(
+
+        type="CocoDataset",
+
+        data_root="",
+
+        ann_file=str(
+            VAL_JSON
+        ),
+
+        data_prefix=dict(
+            img=(
+                str(
+                    VAL_ROOT
+                    /
+                    "images"
+                )
+                +
+                "/"
+            )
+        ),
+
+        metainfo=dict(
+            classes=CLASSES
+        ),
+
+        test_mode=True,
+
+        pipeline=(
+            val_pipeline
+        )
+    )
+)
+
+
+cfg.test_dataloader = (
+    cfg.val_dataloader
+)
+
+
+# ======================================================================
+# 23. EVALUATION
+# ======================================================================
+
+cfg.val_evaluator = [
+
+    dict(
+
+        type="CocoMetric",
+
+        ann_file=str(
+            VAL_JSON
+        ),
+
+        metric="bbox",
+
+        classwise=True,
+
+        format_only=False
+    ),
+
+    dict(
+
+        type="TwoAthleteMetric",
+
+        ann_file=str(
+            VAL_JSON
+        ),
+
+        classes=CLASSES,
+
+        score_thr=(
+            SCORE_THRESHOLD
+        ),
+
+        iou_thr=(
+            MATCH_IOU
+        )
+    )
+]
+
+
+cfg.test_evaluator = (
+    cfg.val_evaluator
+)
+
+
+# ======================================================================
+# 24. OPTIMIZER
+# ======================================================================
+
+cfg.optim_wrapper = dict(
+
+    type=(
+        "AmpOptimWrapper"
+        if USE_AMP
+        else "OptimWrapper"
+    ),
+
+    optimizer=dict(
+
+        type="AdamW",
+
+        lr=(
+            LEARNING_RATE
+        ),
+
+        weight_decay=(
+            WEIGHT_DECAY
+        )
+    ),
+
+    clip_grad=dict(
+
+        max_norm=(
+            GRAD_CLIP
+        ),
+
+        norm_type=2
+    ),
+
+    accumulative_counts=(
+        GRAD_ACCUMULATION
+    ),
+
+    paramwise_cfg=dict(
+
+        custom_keys={
+
+            "backbone": dict(
+
+                lr_mult=(
+                    BACKBONE_LR_MULT
+                )
+            )
+        }
+    )
+)
+
+
+if USE_AMP:
+
+    cfg.optim_wrapper[
+        "loss_scale"
+    ] = "dynamic"
+
+
+cfg.auto_scale_lr = dict(
+
+    enable=False,
+
+    base_batch_size=16
+)
+
+
+# ======================================================================
+# 25. TRAIN SCHEDULE
+# ======================================================================
+
+cfg.train_cfg = dict(
+
+    type="EpochBasedTrainLoop",
+
+    max_epochs=(
+        MAX_EPOCHS
+    ),
+
+    val_interval=1
+)
+
+
+cfg.val_cfg = dict(
+    type="ValLoop"
+)
+
+
+cfg.test_cfg = dict(
+    type="TestLoop"
+)
+
+
+cfg.param_scheduler = [
+
+    dict(
+
+        type="MultiStepLR",
+
+        begin=0,
+
+        end=(
+            MAX_EPOCHS
+        ),
+
+        by_epoch=True,
+
+        milestones=[
+            27,
+            33
+        ],
+
+        gamma=0.1
+    )
+]
+
+
+# ======================================================================
+# 26. LOCAL BEST CHECKPOINT
+#
+# Во время обучения:
+#
+# - только BEST по mAP50:95
+# - optimizer не сохраняем
+# - intermediate epoch checkpoints не пишем
+#
+# Поэтому LOCAL disk почти не растёт.
+# ======================================================================
+
+cfg.default_hooks.checkpoint = dict(
+
+    type="CheckpointHook",
+
+    interval=-1,
+
+    save_last=False,
+
+    save_best="coco/bbox_mAP",
+
+    rule="greater",
+
+    save_optimizer=False,
+
+    save_param_scheduler=False,
+
+    max_keep_ckpts=1
+)
+
+
+cfg.default_hooks.logger.interval = 20
+
+
+# ======================================================================
+# 27. CUSTOM PERIODIC RESUME HOOK
+# ======================================================================
+
+existing_hooks = list(
+    cfg.get(
+        "custom_hooks",
+        []
+    )
+)
+
+
+existing_hooks.append(
+
+    dict(
+
+        type="PeriodicDriveResumeHook",
+
+        out_dir=str(
+            RESUME_DRIVE
+        ),
+
+        interval=(
+            SAVE_RESUME_EVERY_N_EPOCHS
+        ),
+
+        keep_last=(
+            KEEP_LAST_RESUME_CHECKPOINTS
+        ),
+
+        metric_key=(
+            "coco/bbox_mAP"
+        ),
+
+        priority="LOWEST"
+    )
+)
+
+
+cfg.custom_hooks = (
+    existing_hooks
+)
+
+
+# ======================================================================
+# 28. RANDOMNESS
+# ======================================================================
+
+cfg.randomness = dict(
+
+    seed=SEED,
+
+    deterministic=False
+)
+
+
+# ======================================================================
+# 29. LOCAL WORKDIR
+# ======================================================================
+
+cfg.work_dir = str(
+    RUN_DIR
+)
+
+
+# ======================================================================
+# 30. AUTO RESUME
+# ======================================================================
+
+if (
+    AUTO_RESUME
+    and
+    not FORCE_START_FROM_SCRATCH
+    and
+    LATEST_RESUME is not None
+):
+
+    cfg.load_from = str(
+        LATEST_RESUME
+    )
+
+    cfg.resume = True
+
+
+    print("\n" + "=" * 78)
+
+    print(
+        "AUTO RESUME ENABLED"
+    )
+
+    print("=" * 78)
+
+    print(
+        "Continue from:"
+    )
+
+    print(
+        LATEST_RESUME
+    )
+
+else:
+
+    cfg.load_from = None
+
+    cfg.resume = False
+
+
+    print("\n" + "=" * 78)
+
+    print(
+        "STARTING NEW TRAINING"
+    )
+
+    print("=" * 78)
+
+
+# ======================================================================
+# 31. VISUALIZER FIX
+# ======================================================================
+
+Visualizer._instance_dict.clear()
+
+MMLogger._instance_dict.clear()
+
+MessageHub._instance_dict.clear()
+
+
+cfg.visualizer = dict(
+
+    type="DetLocalVisualizer",
+
+    name=(
+        f"visualizer_"
+        f"{RUN_NAME}"
+    ),
+
+    # Не создаём тяжёлые visual outputs.
+    vis_backends=[]
+)
+
+
+RUN_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+# ======================================================================
+# 32. SAVE CURRENT CONFIG LOCALLY
+# ======================================================================
+
+CONFIG_LOCAL = (
+    RUN_DIR
+    /
+    "dino_swin_l_arm_config.py"
+)
+
+
+cfg.dump(
+    str(
+        CONFIG_LOCAL
+    )
+)
+
+
+# ======================================================================
+# 33. INFO
+# ======================================================================
+
+N_TRAIN = len(
+    train_coco[
+        "images"
+    ]
+)
+
+N_VAL = len(
+    val_coco[
+        "images"
+    ]
+)
+
+
+ITERATIONS_PER_EPOCH = math.ceil(
+    N_TRAIN
+    /
+    BATCH_SIZE
+)
+
+
+print("\n" + "=" * 78)
+print("TRAIN SETTINGS")
+print("=" * 78)
+
+
+print(
+    "Model                 : DINO 5-scale + Swin-L"
+)
+
+print(
+    "Queries               :",
+    NUM_QUERIES
+)
+
+print(
+    "Gradient checkpoint   :",
+    WITH_CP
+)
+
+print(
+    "Batch                 :",
+    BATCH_SIZE
+)
+
+print(
+    "Workers               :",
+    NUM_WORKERS
+)
+
+print(
+    "Train images          :",
+    N_TRAIN
+)
+
+print(
+    "Val images            :",
+    N_VAL
+)
+
+print(
+    "Iterations / epoch    :",
+    ITERATIONS_PER_EPOCH
+)
+
+print(
+    "Maximum epochs        :",
+    MAX_EPOCHS
+)
+
+print(
+    "LR                    :",
+    LEARNING_RATE
+)
+
+print(
+    "Primary metric        : mAP@50:95"
+)
+
+print(
+    "Resume every N epochs :",
+    SAVE_RESUME_EVERY_N_EPOCHS
+)
+
+print(
+    "Resume checkpoints kept:",
+    KEEP_LAST_RESUME_CHECKPOINTS
+)
+
+print(
+    "\nLocal data:"
+)
+
+print(
+    LOCAL_DATA_ROOT
+)
+
+print(
+    "\nResume Drive:"
+)
+
+print(
+    RESUME_DRIVE
+)
+
+print(
+    "\nFinal Drive:"
+)
+
+print(
+    FINAL_DRIVE
+)
+
+print("=" * 78)
+
+
+# ======================================================================
+# 34. TRAIN
+# ======================================================================
+
+gc.collect()
+
+torch.cuda.empty_cache()
+
+
+print(
+    "\nCreating Runner..."
+)
+
+
+runner = Runner.from_cfg(
+    cfg
+)
+
+
+print(
+    "\n✓ Runner created"
+)
+
+
+if cfg.resume:
+
+    print(
+        "\n✓ Resume mode ON"
+    )
+
+    print(
+        "MMEngine will restore:"
+    )
+
+    print(
+        "- epoch / iteration"
+    )
+
+    print(
+        "- model weights"
+    )
+
+    print(
+        "- optimizer"
+    )
+
+    print(
+        "- LR scheduler"
+    )
+
+    print(
+        "- AMP optimizer/scaler state"
+    )
+
+
+print(
+    "\nSTART TRAINING\n"
+)
+
+
+runner.train()
+
+
+# ======================================================================
+# 35. ВЫБИРАЕМ ЛУЧШИЕ ВЕСА
+#
+# Вариант A:
+# лучший checkpoint создан в текущем local run.
+#
+# Вариант B:
+# мы resumed обучение, но после resume ни одна эпоха не улучшила
+# предыдущий best -> тогда берём RESUME_DRIVE/best_so_far.pth.
+# ======================================================================
+
+local_best_candidates = list(
+    RUN_DIR.glob(
+        "best_*.pth"
+    )
+)
+
+
+RESUME_BEST = (
+    RESUME_DRIVE
+    /
+    "best_so_far.pth"
+)
+
+
+if local_best_candidates:
+
+    BEST_CHECKPOINT = max(
+
+        local_best_candidates,
+
+        key=lambda p:
+            p.stat().st_mtime
+    )
+
+
+elif RESUME_BEST.is_file():
+
+    BEST_CHECKPOINT = (
+        RESUME_BEST
+    )
+
+
+else:
+
+    raise RuntimeError(
+        "Best checkpoint не найден."
+    )
+
+
+print("\n" + "=" * 78)
+
+print(
+    "BEST CHECKPOINT FOR FINAL EVALUATION"
+)
+
+print("=" * 78)
+
+print(
+    BEST_CHECKPOINT
+)
+
+
+# ======================================================================
+# 36. FINAL EVALUATION
+# ======================================================================
+
+print(
+    "\nLoading BEST weights..."
+)
+
+
+runner.load_checkpoint(
+    str(
+        BEST_CHECKPOINT
+    )
+)
+
+
+print(
+    "\nEvaluating BEST model...\n"
+)
+
+
+final_metrics = (
+    runner.test()
+)
+
+
+# ======================================================================
+# 37. PRINT RESULTS
+# ======================================================================
+
+print("\n" + "=" * 78)
+print("FINAL BEST MODEL RESULTS")
+print("=" * 78)
+
+
+def print_metric(
+    title,
+    key,
+    percentage=True
+):
+
+    value = (
+        final_metrics.get(
+            key
+        )
+    )
+
+
+    if value is None:
+
+        print(
+            f"{title:<34}: "
+            f"NOT FOUND"
+        )
+
+        return
+
+
+    if percentage:
+
+        print(
+            f"{title:<34}: "
+            f"{float(value) * 100:.2f}%"
+        )
+
+    else:
+
+        print(
+            f"{title:<34}: "
+            f"{float(value):.4f}"
+        )
+
+
+print_metric(
+    "mAP@50:95",
+    "coco/bbox_mAP"
+)
+
+
+print_metric(
+    "mAP@50",
+    "coco/bbox_mAP_50"
+)
+
+
+print_metric(
+    "mAP@75",
+    "coco/bbox_mAP_75"
+)
+
+
+print_metric(
+    "Precision",
+    "arm/precision"
+)
+
+
+print_metric(
+    "Recall",
+    "arm/recall"
+)
+
+
+print_metric(
+    "Technique Accuracy",
+    "arm/technique_accuracy"
+)
+
+
+both_correct = (
+    final_metrics.get(
+        "arm/both_correct_pct"
+    )
+)
+
+
+if both_correct is not None:
+
+    print(
+        f"{'Both athletes correct':<34}: "
+        f"{float(both_correct):.2f}%"
+    )
+
+
+# ======================================================================
+# 38. AP PER CLASS
+# ======================================================================
+
+print(
+    "\nAP@50:95 PER CLASS"
+)
+
+print(
+    "-" * 78
+)
+
+
+for class_name in CLASSES:
+
+    key = (
+        f"coco/"
+        f"{class_name}"
+        f"_precision"
+    )
+
+
+    value = final_metrics.get(
+        key
+    )
+
+
+    if value is None:
+
+        print(
+            f"{class_name:<20}: NOT FOUND"
+        )
+
+    else:
+
+        print(
+            f"{class_name:<20}: "
+            f"{float(value) * 100:.2f}%"
+        )
+
+
+# ======================================================================
+# 39. SAVE METRICS LOCAL
+# ======================================================================
+
+metrics_serializable = {}
+
+
+for key, value in (
+    final_metrics.items()
+):
+
+    try:
+
+        metrics_serializable[
+            key
+        ] = float(
+            value
+        )
+
+    except Exception:
+
+        metrics_serializable[
+            key
+        ] = str(
+            value
+        )
+
+
+METRICS_LOCAL = (
+    RUN_DIR
+    /
+    "best_metrics.json"
+)
+
+
+with open(
+    METRICS_LOCAL,
+    "w",
+    encoding="utf-8"
+) as f:
+
+    json.dump(
+        metrics_serializable,
+        f,
+        ensure_ascii=False,
+        indent=2
+    )
+
+
+# ======================================================================
+# 40. FINAL SAVE TO OLD FINAL PATH
+#
+# Сюда пишем только ОДИН РАЗ после полного окончания обучения.
+# ======================================================================
+
+FINAL_WEIGHT = (
+    FINAL_DRIVE
+    /
+    "best_dino_swin_l_map50_95.pth"
+)
+
+FINAL_CONFIG = (
+    FINAL_DRIVE
+    /
+    "dino_swin_l_arm_config.py"
+)
+
+FINAL_METRICS = (
+    FINAL_DRIVE
+    /
+    "best_metrics.json"
+)
+
+
+print("\n" + "=" * 78)
+
+print(
+    "COPY FINAL RESULTS TO FINAL DRIVE"
+)
+
+print("=" * 78)
+
+
+shutil.copy2(
+    BEST_CHECKPOINT,
+    FINAL_WEIGHT
+)
+
+
+shutil.copy2(
+    CONFIG_LOCAL,
+    FINAL_CONFIG
+)
+
+
+shutil.copy2(
+    METRICS_LOCAL,
+    FINAL_METRICS
+)
+
+
+assert FINAL_WEIGHT.is_file()
+
+assert FINAL_CONFIG.is_file()
+
+assert FINAL_METRICS.is_file()
+
+
+print(
+    "\n✓ FINAL BEST:"
+)
+
+print(
+    FINAL_WEIGHT
+)
+
+
+print(
+    "\n✓ FINAL METRICS:"
+)
+
+print(
+    FINAL_METRICS
+)
+
+
+# ======================================================================
+# 41. CLEAN LOCAL
+# ======================================================================
+
+if CLEAN_LOCAL_AFTER_FINISH:
+
+    print(
+        "\nCleaning temporary /content data..."
+    )
+
+    try:
+        del runner
+    except Exception:
+        pass
+
+    gc.collect()
+
+    torch.cuda.empty_cache()
+
+
+    shutil.rmtree(
+        LOCAL_DATA_ROOT,
+        ignore_errors=True
+    )
+
+    shutil.rmtree(
+        LOCAL_RUN_ROOT,
+        ignore_errors=True
+    )
+
+
+    print(
+        "✓ /content temporary data removed"
+    )
+
+
+# ======================================================================
+# 42. FINISH
+# ======================================================================
+
+total, used, free = (
+    shutil.disk_usage(
+        "/content"
+    )
+)
+
+
+print("\n" + "=" * 78)
+
+print(
+    "TRAINING COMPLETE"
+)
+
+print("=" * 78)
+
+
+print(
+    "\nFINAL BEST:"
+)
+
+print(
+    FINAL_WEIGHT
+)
+
+
+print(
+    "\nRESUME DIRECTORY:"
+)
+
+print(
+    RESUME_DRIVE
+)
+
+
+print(
+    "\nLocal free disk:"
+)
+
+print(
+    f"{free / 1024**3:.2f} GB"
+)
+
+print("=" * 78)
